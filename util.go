@@ -73,7 +73,8 @@ func openPcap(
 	if err != nil {
 		return nil, err
 	}
-	if err = pcapHdl.SetBPFFilter(fmt.Sprintf("icmp or port %d", port)); err != nil {
+	filter := fmt.Sprintf("icmp or (port %d and tcp[13] = 18)", port)
+	if err = pcapHdl.SetBPFFilter(filter); err != nil {
 		return nil, err
 	}
 	return pcapHdl, nil
