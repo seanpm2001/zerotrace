@@ -2,6 +2,7 @@ package zerotrace
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
@@ -55,7 +56,12 @@ func extractIPID(ipPkt []byte) (uint16, error) {
 	return uint16(ipPkt[4])<<8 | uint16(ipPkt[5]), nil
 }
 
-func openPcap(iface string, snapLen int32, timeout time.Duration) (*pcap.Handle, error) {
+func openPcap(
+	iface string,
+	snapLen int32,
+	port int,
+	timeout time.Duration,
+) (*pcap.Handle, error) {
 	// Set up our pcap handle.
 	promiscuous := true
 	pcapHdl, err := pcap.OpenLive(
@@ -67,7 +73,7 @@ func openPcap(iface string, snapLen int32, timeout time.Duration) (*pcap.Handle,
 	if err != nil {
 		return nil, err
 	}
-	if err = pcapHdl.SetBPFFilter("icmp"); err != nil {
+	if err = pcapHdl.SetBPFFilter(fmt.Sprintf("icmp or port %d", port)); err != nil {
 		return nil, err
 	}
 	return pcapHdl, nil

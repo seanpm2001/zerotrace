@@ -2,8 +2,11 @@ package zerotrace
 
 import (
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"time"
@@ -17,10 +20,22 @@ var (
 	l = log.New(os.Stderr, "0trace: ", log.Ldate|log.Ltime|log.LUTC|log.Lshortfile)
 )
 
+type seqNums struct {
+	theirs uint32
+	ours   uint32
+}
+
+type fourTuple struct {
+	theirs net.Addr
+	ours   net.Addr
+}
+
 type receiver chan *respPkt
 
 // Config holds configuration options for the ZeroTrace object.
 type Config struct {
+	// Port contains the server's port.
+	Port int
 	// NumProbes determines the number of probes we're sending for a given TTL.
 	NumProbes int
 	// TTLStart determines the TTL at which we start sending trace packets.
@@ -45,6 +60,7 @@ type Config struct {
 //	TTLStart:      5
 //	TTLEnd:        32
 //	SnapLen:       500
+//	Port:          443
 //	PktBufTimeout: time.Millisecond * 10
 //	Interface:     "eth0"
 func NewDefaultConfig() *Config {
@@ -53,6 +69,7 @@ func NewDefaultConfig() *Config {
 		TTLStart:      5,
 		TTLEnd:        32,
 		SnapLen:       500,
+		Port:          443,
 		PktBufTimeout: time.Millisecond * 10,
 		Interface:     "eth0",
 	}
@@ -64,7 +81,40 @@ type ZeroTrace struct {
 	sync.RWMutex
 	quit               chan struct{}
 	incoming, outgoing chan receiver
+	seqsPerTuple       map[*fourTuple]*seqNums // TODO: delete old ones
 	cfg                *Config
+}
+
+func newFourTuple(conn net.Conn) *fourTuple {
+	return &fourTuple{
+		ours:   conn.LocalAddr(),
+		theirs: conn.RemoteAddr(),
+	}
+}
+
+func (z *ZeroTrace) getSeqNums(t *fourTuple) (*seqNums, error) {
+	z.RLock()
+	defer z.RUnlock()
+
+	s, exists := z.seqsPerTuple[t]
+	if !exists {
+		return nil, errors.New("no sequence numbers for given four-tuple")
+	}
+	return s, nil
+}
+
+func (z *ZeroTrace) setSeqNums(t *fourTuple, s *seqNums) {
+	z.Lock()
+	defer z.Unlock()
+
+	z.seqsPerTuple[t] = s
+}
+
+func (z *ZeroTrace) deleteSeqNums(t *fourTuple) {
+	z.Lock()
+	defer z.Unlock()
+
+	delete(z.seqsPerTuple, t)
 }
 
 // OpenZeroTrace instantiates and starts a new ZeroTrace object that's going to
@@ -72,10 +122,11 @@ type ZeroTrace struct {
 func OpenZeroTrace(c *Config) *ZeroTrace {
 	quit := make(chan struct{})
 	zt := &ZeroTrace{
-		cfg:      c,
-		incoming: make(chan receiver),
-		outgoing: make(chan receiver),
-		quit:     quit,
+		cfg:          c,
+		incoming:     make(chan receiver),
+		outgoing:     make(chan receiver),
+		seqsPerTuple: make(map[*fourTuple]*seqNums),
+		quit:         quit,
 	}
 	go zt.listen(quit)
 	return zt
@@ -84,55 +135,6 @@ func OpenZeroTrace(c *Config) *ZeroTrace {
 // Close closes this instance's
 func (z *ZeroTrace) Close() {
 	close(z.quit)
-}
-
-// sendTracePkts sends trace packets to our target.  Once a packet was sent,
-// it's written to the given channel.  The given function is used to create an
-// IP ID that is set in the trace packet's IP header.
-func (z *ZeroTrace) sendTracePkts(c chan *tracePkt, createIPID func() uint16, conn net.Conn) {
-	remoteIP, err := extractRemoteIP(conn)
-	if err != nil {
-		l.Printf("Error extracting remote IP address from connection: %v", err)
-		return
-	}
-
-	for ttl := z.cfg.TTLStart; ttl <= z.cfg.TTLEnd; ttl++ {
-		tempConn := conn.(*tls.Conn)
-		tcpConn := tempConn.NetConn()
-		ipConn := ipv4.NewConn(tcpConn)
-
-		// Set our net.Conn's TTL for future outgoing packets.
-		// We cannot parallelize this loop because the TTL is socket-dependent
-		// and we only have a single socket to work with.
-		if err := ipConn.SetTTL(ttl); err != nil {
-			l.Printf("Error setting TTL: %v", err)
-			return
-		}
-
-		for n := 0; n < z.cfg.NumProbes; n++ {
-			ipID := createIPID()
-			pkt, err := createPkt(conn, ipID)
-			if err != nil {
-				l.Printf("Error creating packet: %v", err)
-				return
-			}
-
-			if err := sendRawPkt(
-				ipID,
-				uint8(ttl),
-				remoteIP,
-				pkt,
-			); err != nil {
-				l.Printf("Error sending raw packet: %v", err)
-			}
-
-			c <- &tracePkt{
-				ttl:  uint8(ttl),
-				ipID: ipID,
-				sent: time.Now().UTC(),
-			}
-		}
-	}
 }
 
 // CalcRTT coordinates our 0trace traceroute and returns the RTT to the target
@@ -190,6 +192,63 @@ loop:
 	return state.calcRTT(), nil
 }
 
+// sendTracePkts sends trace packets to our target.  Once a packet was sent,
+// it's written to the given channel.  The given function is used to create an
+// IP ID that is set in the trace packet's IP header.
+func (z *ZeroTrace) sendTracePkts(c chan *tracePkt, createIPID func() uint16, conn net.Conn) {
+	remoteIP, err := extractRemoteIP(conn)
+	if err != nil {
+		l.Printf("Error extracting remote IP address from connection: %v", err)
+		return
+	}
+
+	tuple := newFourTuple(conn)
+	seqNums, err := z.getSeqNums(tuple)
+	if err != nil {
+		log.Fatalf("Error looking up sequence numbers for conn: %v", err)
+	}
+	log.Printf("Sequence numbers: %v", seqNums)
+	defer z.deleteSeqNums(tuple) // TODO: correct?
+
+	for ttl := z.cfg.TTLStart; ttl <= z.cfg.TTLEnd; ttl++ {
+		tempConn := conn.(*tls.Conn)
+		tcpConn := tempConn.NetConn()
+		ipConn := ipv4.NewConn(tcpConn)
+
+		// Set our net.Conn's TTL for future outgoing packets.
+		// We cannot parallelize this loop because the TTL is socket-dependent
+		// and we only have a single socket to work with.
+		if err := ipConn.SetTTL(ttl); err != nil {
+			l.Printf("Error setting TTL: %v", err)
+			return
+		}
+
+		for n := 0; n < z.cfg.NumProbes; n++ {
+			ipID := createIPID()
+			pkt, err := createPkt(conn, seqNums, ipID)
+			if err != nil {
+				l.Printf("Error creating packet: %v", err)
+				return
+			}
+
+			if err := sendRawPkt(
+				ipID,
+				uint8(ttl),
+				remoteIP,
+				pkt,
+			); err != nil {
+				l.Printf("Error sending raw packet: %v", err)
+			}
+
+			c <- &tracePkt{
+				ttl:  uint8(ttl),
+				ipID: ipID,
+				sent: time.Now().UTC(),
+			}
+		}
+	}
+}
+
 // listen opens a pcap handle and begins listening for incoming ICMP packets.
 // New traceroutes register themselves with this function's event loop to
 // receive a copy of newly-captured ICMP packets.
@@ -199,7 +258,7 @@ func (z *ZeroTrace) listen(quit chan struct{}) {
 		stream    *gopacket.PacketSource
 	)
 
-	pcapHdl, err := openPcap(z.cfg.Interface, z.cfg.SnapLen, z.cfg.PktBufTimeout)
+	pcapHdl, err := openPcap(z.cfg.Interface, z.cfg.SnapLen, z.cfg.Port, z.cfg.PktBufTimeout)
 	if err != nil {
 		log.Fatalf("Error opening pcap device: %v", err)
 	}
@@ -218,9 +277,9 @@ func (z *ZeroTrace) listen(quit chan struct{}) {
 			if pkt == nil {
 				continue
 			}
-			ipLayer := pkt.Layer(layers.LayerTypeIPv4)
-			icmpLayer := pkt.Layer(layers.LayerTypeICMPv4)
-			if ipLayer == nil || icmpLayer == nil {
+			tcpLayer := pkt.Layer(layers.LayerTypeTCP)
+			if tcpLayer != nil {
+				z.handleTCP(pkt)
 				continue
 			}
 
@@ -236,6 +295,41 @@ func (z *ZeroTrace) listen(quit chan struct{}) {
 			}
 		}
 	}
+}
+
+func (z *ZeroTrace) handleTCP(pkt gopacket.Packet) {
+	// Only process SYN/ACK segments.
+	tcpPkt, _ := pkt.Layer(layers.LayerTypeTCP).(*layers.TCP)
+	if !(tcpPkt.SYN && tcpPkt.ACK) {
+		return
+	}
+	log.Println("Processing SYN/ACK segment.")
+
+	ipPkt, _ := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	ours := net.TCPAddrFromAddrPort(
+		netip.MustParseAddrPort(
+			fmt.Sprintf("%s:%d", ipPkt.SrcIP, tcpPkt.SrcPort),
+		),
+	)
+	theirs := net.TCPAddrFromAddrPort(
+		netip.MustParseAddrPort(
+			fmt.Sprintf("%s:%d", ipPkt.DstIP, tcpPkt.DstPort),
+		),
+	)
+
+	tuple := &fourTuple{
+		theirs: theirs,
+		ours:   ours,
+	}
+	seqNums := &seqNums{
+		theirs: tcpPkt.Seq,
+		ours:   tcpPkt.Ack,
+	}
+	log.Printf("4-tuple:  %v", tuple)
+	log.Printf("Seq nums: %v", seqNums)
+
+	z.setSeqNums(tuple, seqNums)
+
 }
 
 // extractRcvdPkt extracts what we need (IP ID, timestamp, address) from the
