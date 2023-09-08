@@ -203,9 +203,12 @@ func (z *ZeroTrace) sendTracePkts(c chan *tracePkt, createIPID func() uint16, co
 	}
 
 	tuple := newFourTuple(conn)
+	log.Printf("Looking up four-tuple: %v", tuple)
+
 	seqNums, err := z.getSeqNums(tuple)
 	if err != nil {
-		log.Fatalf("Error looking up sequence numbers for conn: %v", err)
+		log.Printf("Error looking up sequence numbers for conn: %v", err)
+		return
 	}
 	log.Printf("Sequence numbers: %v", seqNums)
 	defer z.deleteSeqNums(tuple) // TODO: correct?
